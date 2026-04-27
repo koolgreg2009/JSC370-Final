@@ -1,0 +1,9 @@
+---
+title: "About This Website"
+author: "Kevin Hu"
+---
+
+
+
+Hello! I'm Kevin Hu, a Computer Science and Data Science Student with a passion for data analysis and machine learning.
+

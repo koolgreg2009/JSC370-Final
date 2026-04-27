@@ -1,0 +1,1322 @@
+---
+title: "JSC370 Final Project"
+author: "Kevin Hu"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  echo: false
+jupyter: python3
+---
+
+# Introduction
+
+This notebook supports the final project question: **how do budget, audience engagement, genre, and release timing relate to box office revenue for movies released from 2010 to 2024?** The goal here is to keep the analysis reproducible and document the main modeling choices without duplicating the full written report.
+
+# Methods
+
+The underlying data were collected from the TMDB API in the midterm workflow using `discover/movie` and `/movie/{movie_id}` endpoints. This notebook starts from the cleaned movie-level CSV and focuses on feature preparation, model comparison, and interactive visualization.
+
+Key preprocessing choices:
+
+- keep only released, non-adult movies with positive reported budget and revenue
+- work on the `log_revenue` scale because raw revenue is highly skewed
+- collapse infrequent genres into `Other` to stabilize categorical effects
+- center release year and log-transform popularity for better numerical behavior
+
+The workflow uses a single 80/20 train test split. The regression models are fit and interpreted on the training data, while XGBoost is tuned on the training set and then evaluated on the test set as the final predictive model.
+
+## Reproducibility Notes
+
+This file is the reproducible analysis source for the final project. The rendered report hides code, but all tables, model fits, and visualizations below are generated from this document.
+
+```{python}
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import altair as alt
+import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.preprocessing import OneHotEncoder
+from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.stats.stattools import durbin_watson
+```
+
+```{python}
+pd.options.display.float_format = "{:,.2f}".format
+
+DATA_PATH = Path("data/tmdb_movies_revenue_sample.csv")
+
+if not DATA_PATH.exists():
+    raise FileNotFoundError(
+        f"Expected cleaned movie data at {DATA_PATH}. "
+        "Render the midterm pipeline first or copy the CSV into the expected location."
+    )
+```
+
+## Prepared Dataset
+
+Load the cleaned movie data and create the transformed variables used throughout the notebook.
+
+```{python}
+movies = pd.read_csv(DATA_PATH)
+
+genre_counts = movies["genres"].str.split(", ").str[0].value_counts()
+major_genres = genre_counts[genre_counts >= 50].index
+
+movies = (
+    movies.assign(
+        release_date=lambda df: pd.to_datetime(df["release_date"], errors="coerce"),
+        primary_genre=lambda df: df["genres"].str.split(", ").str[0],
+        release_month=lambda df: df["release_date"].dt.month,
+        log_budget=lambda df: np.log10(df["budget"]),
+        log_revenue=lambda df: np.log10(df["revenue"]),
+        log_vote_count=lambda df: np.log10(df["vote_count"]),
+        log_popularity=lambda df: np.log1p(df["popularity"]),
+        in_collection=lambda df: df["in_collection"].astype("int64"),
+        year_centered=lambda df: df["release_year"] - df["release_year"].mean(),
+    )
+    .assign(
+        primary_genre=lambda df: np.where(
+            df["primary_genre"].isin(major_genres),
+            df["primary_genre"],
+            "Other",
+        )
+    )
+    .dropna(
+        subset=[
+            "log_budget",
+            "log_revenue",
+            "log_vote_count",
+            "log_popularity",
+            "vote_average",
+            "year_centered",
+            "primary_genre",
+        ]
+    )
+    .reset_index(drop=True)
+)
+
+movies.shape
+```
+
+This output records the final modeling sample size after filtering and feature preparation.
+
+```{python}
+summary_table = (
+    movies[
+        [
+            "budget",
+            "revenue",
+            "runtime",
+            "popularity",
+            "vote_average",
+            "vote_count",
+        ]
+    ]
+    .agg(["count", "mean", "median", "min", "max"])
+    .T
+    .reset_index()
+    .rename(columns={"index": "variable"})
+)
+
+summary_table
+```
+
+The summary table provides a quick numeric overview of the main financial and engagement variables before fitting any models.
+
+```{python}
+genre_table = (
+    movies.groupby("primary_genre", as_index=False)
+    .agg(
+        n_movies=("id", "count"),
+        median_budget=("budget", "median"),
+        median_revenue=("revenue", "median"),
+        mean_vote_average=("vote_average", "mean"),
+    )
+    .sort_values("n_movies", ascending=False)
+    .head(10)
+)
+
+genre_table
+```
+
+The genre table shows which groups are large enough to support stable comparisons and which categories were later folded into `Other`.
+
+# Exploratory Results
+
+These quick checks confirm the main distributional patterns before modeling: heavy skew in the financial variables, uneven genre coverage, and a positive budget-revenue relationship.
+
+```{python}
+fig_revenue_raw = px.histogram(
+    movies,
+    x="revenue",
+    nbins=40,
+    title="Raw Box Office Revenue Distribution",
+    labels={"revenue": "Revenue (USD)"},
+    template="plotly_white",
+)
+fig_revenue_raw.update_layout(yaxis_title="Number of movies")
+fig_revenue_raw.show()
+```
+
+```{python}
+fig_budget_revenue = px.scatter(
+    movies,
+    x="log_budget",
+    y="log_revenue",
+    color="primary_genre",
+    size="vote_count",
+    hover_data=["title", "release_year", "runtime", "vote_average"],
+    title="Budget and Revenue Relationship by Genre",
+    labels={
+        "log_budget": "log10(budget in USD)",
+        "log_revenue": "log10(revenue in USD)",
+        "primary_genre": "Primary genre",
+    },
+    template="plotly_white",
+)
+fig_budget_revenue.show()
+```
+
+```{python}
+top_genres = movies["primary_genre"].value_counts().head(8).index.tolist()
+plot_data = movies.loc[movies["primary_genre"].isin(top_genres)].copy()
+
+fig_genre_box = px.box(
+    plot_data,
+    x="primary_genre",
+    y="log_revenue",
+    color="primary_genre",
+    title="Revenue Distribution Across Major Genres",
+    labels={
+        "primary_genre": "Primary genre",
+        "log_revenue": "log10(revenue in USD)",
+    },
+    template="plotly_white",
+)
+fig_genre_box.update_layout(showlegend=False)
+fig_genre_box.show()
+```
+
+```{python}
+yearly_trends = (
+    movies.groupby("release_year", as_index=False)
+    .agg(
+        median_budget=("budget", "median"),
+        median_revenue=("revenue", "median"),
+        n_movies=("id", "count"),
+    )
+    .assign(
+        log_median_budget=lambda df: np.log10(df["median_budget"]),
+        log_median_revenue=lambda df: np.log10(df["median_revenue"]),
+    )
+)
+
+fig_yearly = go.Figure()
+fig_yearly.add_trace(
+    go.Scatter(
+        x=yearly_trends["release_year"],
+        y=yearly_trends["log_median_budget"],
+        mode="lines+markers",
+        name="Median budget",
+    )
+)
+fig_yearly.add_trace(
+    go.Scatter(
+        x=yearly_trends["release_year"],
+        y=yearly_trends["log_median_revenue"],
+        mode="lines+markers",
+        name="Median revenue",
+    )
+)
+fig_yearly.update_layout(
+    title="Median Budget and Revenue Over Time",
+    xaxis_title="Release year",
+    yaxis_title="log10(USD)",
+    template="plotly_white",
+)
+fig_yearly.show()
+```
+
+# Modeling
+
+This section moves from interpretable regression benchmarks to the final XGBoost model. The split is fixed once here so every model is built from the same underlying training and test partitions.
+
+```{python}
+model_data = movies[
+    [
+        "log_revenue",
+        "log_budget",
+        "log_vote_count",
+        "log_popularity",
+        "vote_average",
+        "year_centered",
+        "primary_genre",
+        "in_collection",
+    ]
+].copy()
+
+train_df, test_df = train_test_split(model_data, test_size=0.2, random_state=370)
+
+train_df.shape, test_df.shape
+```
+
+This split is the backbone of the modeling workflow: training data for fitting and tuning, and a test set reserved for the final XGBoost evaluation.
+
+```{python}
+bounds = {
+    "log_budget": (train_df["log_budget"].min(), train_df["log_budget"].max()),
+    "log_vote_count": (train_df["log_vote_count"].min(), train_df["log_vote_count"].max()),
+    "log_popularity": (train_df["log_popularity"].min(), train_df["log_popularity"].max()),
+    "year_centered": (train_df["year_centered"].min(), train_df["year_centered"].max()),
+}
+
+test_df_gam = test_df.copy()
+for col, (lb, ub) in bounds.items():
+    test_df_gam[col] = test_df_gam[col].clip(lb, ub)
+```
+
+These spline bounds are defined from the training data so the GAM can be evaluated safely without extrapolation errors.
+
+## Linear Regression Benchmark
+
+Start with an additive OLS model using the transformed predictors and robust standard errors.
+
+```{python}
+linear_formula = (
+    "log_revenue ~ log_budget + log_vote_count + log_popularity + "
+    "vote_average + year_centered + C(primary_genre) + in_collection"
+)
+
+linear_model = smf.ols(linear_formula, data=train_df).fit(cov_type="HC3")
+
+coef_table = (
+    linear_model.summary2().tables[1]
+    .reset_index()
+    .rename(columns={"index": "term"})
+    .sort_values("Coef.", ascending=False, key=np.abs)
+)
+
+coef_table.head(15)
+```
+
+This first table surfaces the largest linear coefficients before the full model summary.
+
+```{python}
+display(linear_model.summary())
+```
+
+The full OLS summary is kept here as the main reference output for coefficient direction, approximate significance, and overall model fit.
+
+### Linear Regression Diagnostics
+
+These checks focus on the four core assumptions most relevant for this report: linearity, constant variance, residual normality, and independence.
+
+```{python}
+linear_diagnostic_df = pd.DataFrame(
+    {
+        "fitted": linear_model.fittedvalues,
+        "residual": linear_model.resid,
+    }
+)
+
+fig_linear_resid = px.scatter(
+    linear_diagnostic_df,
+    x="fitted",
+    y="residual",
+    title="Linear Regression Residuals vs Fitted",
+    labels={"fitted": "Fitted log10(revenue)", "residual": "Residual"},
+    template="plotly_white",
+)
+fig_linear_resid.add_hline(y=0, line_dash="dash", line_color="#7f8c8d")
+fig_linear_resid.show()
+```
+
+```{python}
+fig = sm.qqplot(linear_model.resid, line="45", fit=True)
+fig.axes[0].set_title("Linear Regression Q-Q Plot")
+fig.axes[0].set_xlabel("Theoretical Quantiles")
+fig.axes[0].set_ylabel("Sample Quantiles")
+```
+
+```{python}
+bp_test = het_breuschpagan(linear_model.resid, linear_model.model.exog)
+
+linear_assumption_checks = pd.DataFrame(
+    {
+        "assumption": [
+            "Independence (Durbin-Watson)",
+            "Constant variance (Breusch-Pagan LM)",
+            "Constant variance (Breusch-Pagan F)",
+        ],
+        "statistic": [
+            durbin_watson(linear_model.resid),
+            bp_test[0],
+            bp_test[2],
+        ],
+        "p_value": [
+            np.nan,
+            bp_test[1],
+            bp_test[3],
+        ],
+    }
+).assign(
+    statistic=lambda df: df["statistic"].round(3),
+    p_value=lambda df: df["p_value"].map(
+        lambda x: "" if pd.isna(x) else ("<0.001" if x < 0.001 else f"{x:.3f}")
+    ),
+)
+
+linear_assumption_checks
+```
+
+This diagnostic summary complements the plots by reporting independence and heteroskedasticity checks in table form.
+
+## GAM-Style Additive Spline Model
+
+Use spline terms for the continuous predictors most likely to be nonlinear. Test-set values are clipped to the training spline bounds before prediction to avoid extrapolation issues in `patsy`.
+
+```{python}
+gam_formula = (
+    "log_revenue ~ "
+    f"bs(log_budget, df=6, lower_bound={bounds['log_budget'][0]}, upper_bound={bounds['log_budget'][1]}) + "
+    f"bs(log_vote_count, df=5, lower_bound={bounds['log_vote_count'][0]}, upper_bound={bounds['log_vote_count'][1]}) + "
+    f"bs(log_popularity, df=5, lower_bound={bounds['log_popularity'][0]}, upper_bound={bounds['log_popularity'][1]}) + "
+    f"bs(year_centered, df=5, lower_bound={bounds['year_centered'][0]}, upper_bound={bounds['year_centered'][1]}) + "
+    "vote_average + C(primary_genre) + in_collection"
+)
+
+gam_model = smf.ols(gam_formula, data=train_df).fit()
+display(gam_model.summary())
+```
+
+The GAM summary is included mainly for overall fit comparison; the spline basis coefficients themselves are not interpreted directly.
+
+```{python}
+budget_grid = pd.DataFrame(
+    {
+        "log_budget": np.linspace(
+            bounds["log_budget"][0],
+            bounds["log_budget"][1],
+            100,
+        )
+    }
+)
+
+reference_row = {
+    "log_vote_count": movies["log_vote_count"].median(),
+    "log_popularity": movies["log_popularity"].median(),
+    "vote_average": movies["vote_average"].median(),
+    "year_centered": 0.0,
+    "primary_genre": movies["primary_genre"].mode()[0],
+    "in_collection": int(movies["in_collection"].mode()[0]),
+}
+
+for column, value in reference_row.items():
+    budget_grid[column] = value
+
+budget_grid["predicted_log_revenue"] = gam_model.predict(budget_grid)
+
+fig_partial_budget = px.line(
+    budget_grid,
+    x="log_budget",
+    y="predicted_log_revenue",
+    title="Estimated Nonlinear Effect of Budget in the Spline GAM",
+    labels={
+        "log_budget": "log10(budget in USD)",
+        "predicted_log_revenue": "Predicted log10(revenue)",
+    },
+    template="plotly_white",
+)
+fig_partial_budget.show()
+```
+
+This partial effect plot is the main interpretive output from the GAM and is more useful than the raw spline coefficients.
+
+### GAM Diagnostics
+
+These diagnostics mirror the linear-model checks and are mainly useful as a comparison against OLS. The main question is whether the spline terms reduce residual structure rather than whether the GAM achieves perfect residual behavior.
+
+```{python}
+gam_diagnostic_df = pd.DataFrame(
+    {
+        "fitted": gam_model.fittedvalues,
+        "residual": gam_model.resid,
+    }
+)
+
+fig_gam_resid = px.scatter(
+    gam_diagnostic_df,
+    x="fitted",
+    y="residual",
+    title="Spline GAM Residuals vs Fitted",
+    labels={"fitted": "Fitted log10(revenue)", "residual": "Residual"},
+    template="plotly_white",
+)
+fig_gam_resid.add_hline(y=0, line_dash="dash", line_color="#7f8c8d")
+fig_gam_resid.show()
+```
+
+```{python}
+fig = sm.qqplot(gam_model.resid, line="45", fit=True)
+fig.axes[0].set_title("GAM Q-Q Plot")
+fig.axes[0].set_xlabel("Theoretical Quantiles")
+fig.axes[0].set_ylabel("Sample Quantiles")
+```
+
+## Simplified GAM
+
+This reduced GAM keeps spline terms only for `log_budget` and `log_vote_count` to check whether the full additive model is unnecessarily flexible.
+
+```{python}
+gam_formula_simple = (
+    "log_revenue ~ "
+    f"bs(log_budget, df=4, lower_bound={bounds['log_budget'][0]}, upper_bound={bounds['log_budget'][1]}) + "
+    f"bs(log_vote_count, df=4, lower_bound={bounds['log_vote_count'][0]}, upper_bound={bounds['log_vote_count'][1]}) + "
+    "log_popularity + vote_average + year_centered + "
+    "C(primary_genre) + in_collection"
+)
+
+gam_model_simple = smf.ols(gam_formula_simple, data=train_df).fit()
+display(gam_model_simple.summary())
+```
+
+This simplified specification acts as a refinement check rather than a separate final model.
+
+## XGBoost Benchmark
+
+XGBoost is included as the final predictive model. The goal here is to test whether a flexible tree-based method adds useful predictive power once the regression benchmarks have established the broad structure of the problem.
+
+```{python}
+feature_columns = [
+    "log_budget",
+    "log_vote_count",
+    "log_popularity",
+    "vote_average",
+    "year_centered",
+    "in_collection",
+    "primary_genre",
+]
+
+X_train = train_df[feature_columns].copy()
+X_test = test_df[feature_columns].copy()
+y_train = train_df["log_revenue"].copy()
+y_test = test_df["log_revenue"].copy()
+
+numeric_features = [
+    "log_budget",
+    "log_vote_count",
+    "log_popularity",
+    "vote_average",
+    "year_centered",
+    "in_collection",
+]
+categorical_features = ["primary_genre"]
+```
+
+```{python}
+tree_preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", "passthrough", numeric_features),
+        ("cat", OneHotEncoder(drop="first", handle_unknown="ignore"), categorical_features),
+    ]
+)
+
+X_train_tree = tree_preprocessor.fit_transform(X_train)
+X_test_tree = tree_preprocessor.transform(X_test)
+
+try:
+    from xgboost import XGBRegressor
+
+    xgb_base = XGBRegressor(
+        objective="reg:squarederror",
+        random_state=370,
+        n_jobs=-1,
+    )
+
+    xgb_param_grid = {
+        "n_estimators": [200, 400],
+        "learning_rate": [0.03, 0.05, 0.1],
+        "max_depth": [3, 4, 5],
+        "subsample": [0.8, 1.0],
+        "colsample_bytree": [0.8, 1.0],
+    }
+
+    xgb_grid = GridSearchCV(
+        estimator=xgb_base,
+        param_grid=xgb_param_grid,
+        scoring="neg_root_mean_squared_error",
+        cv=5,
+        n_jobs=-1,
+        verbose=1,
+    )
+
+    xgb_grid.fit(X_train_tree, y_train)
+    xgb_model = xgb_grid.best_estimator_
+    xgb_predictions = xgb_model.predict(X_test_tree)
+    xgb_available = True
+except ImportError:
+    xgb_predictions = np.full_like(y_test, np.nan, dtype=float)
+    xgb_available = False
+    print("xgboost is not installed; skipping XGBoost benchmark.")
+```
+
+This block handles both preprocessing and model tuning so the final XGBoost fit is reproducible from the notebook alone.
+
+```{python}
+if xgb_available:
+    pd.DataFrame([xgb_grid.best_params_]).assign(best_cv_rmse=-xgb_grid.best_score_)
+```
+
+The table above records the tuned hyperparameters selected by grid search with 5-fold cross-validation.
+
+```{python}
+xgb_holdout_table = pd.DataFrame(
+    {
+        "Model": ["XGBoost"],
+        "Test RMSE": [
+            np.sqrt(mean_squared_error(y_test, xgb_predictions)) if xgb_available else np.nan
+        ],
+        "Test MAE": [
+            mean_absolute_error(y_test, xgb_predictions) if xgb_available else np.nan
+        ],
+        "Test R-squared": [
+            r2_score(y_test, xgb_predictions) if xgb_available else np.nan
+        ],
+    }
+).round(3)
+
+xgb_holdout_table
+```
+
+This is the key final-model evaluation table: these test-set metrics are reserved for XGBoost only.
+
+## SHAP Explanations
+
+SHAP is used here as the main interpretation layer for XGBoost.
+
+```{python}
+try:
+    import shap
+
+    shap_available = True
+except ImportError:
+    shap_available = False
+    print("shap is not installed; skipping SHAP analysis.")
+```
+
+```{python}
+if shap_available:
+    X_test_tree_dense = X_test_tree.toarray() if hasattr(X_test_tree, "toarray") else X_test_tree
+    feature_names = tree_preprocessor.get_feature_names_out()
+    xgb_explainer = shap.TreeExplainer(xgb_model)
+    xgb_shap_values = xgb_explainer.shap_values(X_test_tree_dense)
+    xgb_test_meta = pd.DataFrame(
+        {
+            "title": movies.loc[test_df.index, "title"].values,
+            "primary_genre": movies.loc[test_df.index, "primary_genre"].values,
+            "release_year": movies.loc[test_df.index, "release_year"].values,
+        }
+    )
+
+    xgb_shap_importance = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "mean_abs_shap": np.abs(xgb_shap_values).mean(axis=0),
+        }
+    ).sort_values("mean_abs_shap", ascending=False)
+
+    xgb_shap_importance.head(15)
+```
+
+This output summarizes which encoded features matter most on average to the final XGBoost predictions.
+
+```{python}
+if shap_available and xgb_available:
+    fig = px.bar(
+        xgb_shap_importance.head(15),
+        x="mean_abs_shap",
+        y="feature",
+        orientation="h",
+        title="XGBoost SHAP Importance",
+        labels={"mean_abs_shap": "Mean absolute SHAP value", "feature": "Feature"},
+        template="plotly_white",
+    )
+    fig.update_layout(yaxis={"categoryorder": "total ascending"})
+    fig.show()
+```
+
+The SHAP importance chart provides a global ranking of which features the final model relies on most heavily.
+
+```{python}
+if shap_available and xgb_available:
+    observation_index = 0
+    xgb_base_value = np.ravel(xgb_explainer.expected_value)[0]
+    waterfall_feature_names = [
+        name.replace("num__", "")
+        .replace("cat__primary_genre_", "genre: ")
+        .replace("_", " ")
+        for name in feature_names
+    ]
+
+    xgb_explanation = shap.Explanation(
+        values=xgb_shap_values[observation_index],
+        base_values=xgb_base_value,
+        data=X_test_tree_dense[observation_index],
+        feature_names=waterfall_feature_names,
+    )
+
+    shap.plots.waterfall(xgb_explanation, max_display=12, show=False)
+    plt.title("XGBoost SHAP Waterfall Plot for One Test-Set Movie", pad=18)
+    plt.tight_layout()
+    plt.show()
+
+```
+
+The waterfall plot is a local explanation for one test-set movie and shows how feature contributions move the prediction from the baseline to the final movie-specific value.
+
+
+# Results
+
+This section collects the final comparison tables and keeps the main interpretation artifacts close to the fitted models.
+
+## Modeling Decisions
+
+These are the main specification choices carried into the final version of the notebook.
+
+- I centered release year because the uncentered year variable contributed to a very large condition number and made the intercept difficult to interpret.
+- I used `log_popularity` instead of raw popularity because popularity is right-skewed and a log transform reduces the influence of extreme values.
+- I collapsed infrequent genres into `Other` to avoid unstable coefficient estimates for categories with very small sample sizes.
+- I removed runtime from the main specification because it was not statistically useful in the first-pass OLS fit and added complexity without improving interpretability.
+
+The notebook keeps the simplified GAM as a refinement check, but the main comparison remains linear regression, GAM, and XGBoost.
+
+## Report Tables
+
+These tables are formatted for direct copy/paste into Google Docs. If needed, the final cell also writes simple HTML versions that preserve formatting outside the notebook.
+
+```{python}
+linear_coef_table = (
+    linear_model.summary2().tables[1]
+    .reset_index()
+    .rename(
+        columns={
+            "index": "term",
+            "Coef.": "coef",
+            "Std.Err.": "std_err",
+            "z": "stat",
+            "P>|z|": "p_value",
+            "[0.025": "ci_low",
+            "0.975]": "ci_high",
+        }
+    )
+    .loc[:, ["term", "coef", "std_err", "stat", "p_value", "ci_low", "ci_high"]]
+    .assign(
+        coef=lambda df: df["coef"].round(3),
+        std_err=lambda df: df["std_err"].round(3),
+        stat=lambda df: df["stat"].round(2),
+        p_value=lambda df: df["p_value"].map(lambda x: "<0.001" if x < 0.001 else f"{x:.3f}"),
+        ci_low=lambda df: df["ci_low"].round(3),
+        ci_high=lambda df: df["ci_high"].round(3),
+    )
+)
+
+linear_coef_table
+```
+
+This is the cleaned coefficient table intended for the written report.
+
+
+```{python}
+training_model_overview = pd.DataFrame(
+    {
+        "Model": ["Linear regression", "Spline GAM", "XGBoost"],
+        "Train RMSE": [
+            np.sqrt(mean_squared_error(y_train, linear_model.predict(train_df))),
+            np.sqrt(mean_squared_error(y_train, gam_model.predict(train_df))),
+            np.sqrt(mean_squared_error(y_train, xgb_model.predict(X_train_tree))) if xgb_available else np.nan,
+        ],
+        "Train MAE": [
+            mean_absolute_error(y_train, linear_model.predict(train_df)),
+            mean_absolute_error(y_train, gam_model.predict(train_df)),
+            mean_absolute_error(y_train, xgb_model.predict(X_train_tree)) if xgb_available else np.nan,
+        ],
+        "Train R-squared": [
+            r2_score(y_train, linear_model.predict(train_df)),
+            r2_score(y_train, gam_model.predict(train_df)),
+            r2_score(y_train, xgb_model.predict(X_train_tree)) if xgb_available else np.nan,
+        ],
+    }
+).round(3)
+
+training_model_overview
+```
+
+This training summary gives a like-for-like view of how the three main models fit the training data.
+
+```{python}
+model_fit_table = xgb_holdout_table.copy()
+
+model_fit_table
+```
+
+This test-set table is repeated here because it is the final performance summary used in the report.
+
+```{python}
+if xgb_available:
+    xgb_tuning_table = (
+        pd.DataFrame([xgb_grid.best_params_])
+        .assign(best_cv_rmse=round(-xgb_grid.best_score_, 3))
+        .rename(
+            columns={
+                "n_estimators": "n_estimators",
+                "learning_rate": "learning_rate",
+                "max_depth": "max_depth",
+                "subsample": "subsample",
+                "colsample_bytree": "colsample_bytree",
+                "best_cv_rmse": "best_cv_rmse",
+            }
+        )
+    )
+    xgb_tuning_table
+```
+
+This tuning table records the final hyperparameter choice for the selected XGBoost model.
+
+
+# Interactive Visualizations
+
+These three views are meant to complement the written report rather than repeat it: one for the structure of the data, one for how the fitted models behave on the training set, and one for interpreting the final XGBoost model.
+
+```{python}
+alt.data_transformers.disable_max_rows()
+
+movie_blue_scale = ["#d5e9ff", "#8fbfe5", "#3f7ca8", "#012b42"]
+genre_palette = [
+    "#4e79a7",
+    "#f28e2c",
+    "#e15759",
+    "#76b7b2",
+    "#59a14f",
+    "#edc949",
+    "#af7aa1",
+    "#9c755f",
+]
+```
+
+## 1. 3D Revenue Landscape
+
+This view shows a smoothed revenue surface and lets the reader switch among three predictor pairs from the strongest continuous features.
+
+```{python}
+surface_pair_specs = {
+    "budget_vote_count": {
+        "label": "Budget x Vote Count",
+        "x": "log_budget",
+        "x_label": "log10(budget)",
+        "y": "log_vote_count",
+        "y_label": "log10(vote count)",
+        "colorscale": [[0.0, "#d5e9ff"], [1.0, "#012b42"]],
+    },
+    "budget_vote_average": {
+        "label": "Budget x Vote Average",
+        "x": "log_budget",
+        "x_label": "log10(budget)",
+        "y": "vote_average",
+        "y_label": "vote average",
+        "colorscale": [[0.0, "#ffdbe8"], [1.0, "#3d0c63"]],
+    },
+    "vote_count_vote_average": {
+        "label": "Vote Count x Vote Average",
+        "x": "log_vote_count",
+        "x_label": "log10(vote count)",
+        "y": "vote_average",
+        "y_label": "vote average",
+        "colorscale": [[0.0, "#bcffc4"], [1.0, "#1d4e00"]],
+    },
+}
+
+surface_df = movies.copy()
+surface_traces = []
+pair_keys = list(surface_pair_specs.keys())
+
+for pair_key in pair_keys:
+    spec = surface_pair_specs[pair_key]
+    x_name = spec["x"]
+    y_name = spec["y"]
+
+    x_centers = np.linspace(surface_df[x_name].min(), surface_df[x_name].max(), 36)
+    y_centers = np.linspace(surface_df[y_name].min(), surface_df[y_name].max(), 36)
+    x_grid, y_grid = np.meshgrid(x_centers, y_centers)
+    xy_points = surface_df[[x_name, y_name]].to_numpy()
+    grid_points = np.column_stack([x_grid.ravel(), y_grid.ravel()])
+
+    smooth_model = KNeighborsRegressor(
+        n_neighbors=28,
+        weights="distance",
+    )
+    smooth_model.fit(xy_points, surface_df["log_revenue"].to_numpy())
+    z_values = smooth_model.predict(grid_points).reshape(x_grid.shape)
+
+    valid_z = z_values[~np.isnan(z_values)]
+    z_min = float(valid_z.min()) if valid_z.size else 0.0
+    z_max = float(valid_z.max()) if valid_z.size else 1.0
+
+    surface_traces.append(
+        go.Surface(
+            x=x_grid,
+            y=y_grid,
+            z=z_values,
+            visible=pair_key == pair_keys[0],
+            colorscale=spec["colorscale"],
+            colorbar=dict(
+                title=dict(
+                    text="Predicted<br>log10(revenue)",
+                    side="top",
+                    font=dict(size=12, color="#22384d"),
+                ),
+                thickness=16,
+                len=0.58,
+                x=0.98,
+                y=0.5,
+                outlinewidth=0,
+                bgcolor="rgba(255,255,255,0.92)",
+            ),
+            contours=dict(
+                z=dict(show=True, usecolormap=False, color="#ffffff", width=1)
+            ),
+            hovertemplate=(
+                f"{spec['x_label']}: " + "%{x:.2f}<br>"
+                f"{spec['y_label']}: " + "%{y:.2f}<br>"
+                "smoothed log10(revenue): %{z:.2f}<extra></extra>"
+            ),
+            cmin=z_min,
+            cmax=z_max,
+            showscale=True,
+        )
+    )
+
+fig_surface = go.Figure(data=surface_traces)
+
+feature_buttons = []
+for active_index, pair_key in enumerate(pair_keys):
+    spec = surface_pair_specs[pair_key]
+    visibility = [False] * len(pair_keys)
+    visibility[active_index] = True
+    feature_buttons.append(
+        dict(
+            label=spec["label"],
+            method="update",
+            args=[
+                {"visible": visibility},
+                {
+                    "title": f"Revenue Surface: {spec['label']}",
+                    "scene.xaxis.title.text": spec["x_label"],
+                    "scene.yaxis.title.text": spec["y_label"],
+                    "scene.zaxis.title.text": "log10(revenue)",
+                },
+            ],
+        )
+    )
+
+fig_surface.update_layout(
+    title=dict(
+        text=f"Revenue Surface<br><span style='font-size:0.6em;color:#4f657c'>{surface_pair_specs[pair_keys[0]]['label']}</span>",
+        x=0.02,
+        xanchor="left",
+    ),
+    template="plotly_white",
+    font=dict(color="#152535", size=13),
+    title_font=dict(size=20, color="#12263a"),
+    margin=dict(l=0, r=0, t=145, b=0),
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    hoverlabel=dict(
+        bgcolor="rgba(255,255,255,0.97)",
+        bordercolor="#d8e2ec",
+        font=dict(color="#152535", size=12),
+        align="left",
+    ),
+    updatemenus=[
+        dict(
+            type="dropdown",
+            direction="down",
+            x=0.02,
+            y=0.995,
+            xanchor="left",
+            yanchor="top",
+            bgcolor="rgba(255,255,255,0.98)",
+            bordercolor="#d9e2ec",
+            borderwidth=1,
+            font=dict(size=12, color="#22384d"),
+            buttons=feature_buttons,
+            showactive=True,
+        ),
+    ],
+    annotations=[
+        dict(
+            text="Predictor Pair",
+            x=0.02,
+            y=1.04,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font=dict(size=12, color="#5f7388"),
+            align="left",
+        ),
+        dict(
+            text="Smoothed log10(revenue) surface across the strongest continuous predictors",
+            x=0.02,
+            y=1.105,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font=dict(size=13, color="#4f657c"),
+            align="left",
+        ),
+    ],
+    scene=dict(
+        bgcolor="#ffffff",
+        xaxis=dict(
+            title=dict(text=surface_pair_specs[pair_keys[0]]["x_label"], font=dict(color="#22384d")),
+            tickfont=dict(color="#53687d"),
+            showticklabels=True,
+            backgroundcolor="#ffffff",
+            gridcolor="#dfe8f1",
+            zerolinecolor="#c7d3df",
+            showspikes=True,
+            spikecolor="#9db5ca",
+            spikethickness=2,
+            spikesides=False,
+        ),
+        yaxis=dict(
+            title=dict(text=surface_pair_specs[pair_keys[0]]["y_label"], font=dict(color="#22384d")),
+            tickfont=dict(color="#53687d"),
+            showticklabels=True,
+            backgroundcolor="#ffffff",
+            gridcolor="#dfe8f1",
+            zerolinecolor="#c7d3df",
+            showspikes=True,
+            spikecolor="#9db5ca",
+            spikethickness=2,
+            spikesides=False,
+        ),
+        zaxis=dict(
+            title=dict(
+                text="log10(revenue)",
+                font=dict(color="#22384d"),
+            ),
+            tickfont=dict(color="#53687d"),
+            showticklabels=True,
+            backgroundcolor="#ffffff",
+            gridcolor="#dfe8f1",
+            zerolinecolor="#c7d3df",
+            showspikes=True,
+            spikecolor="#9db5ca",
+            spikethickness=2,
+            spikesides=False,
+        ),
+        camera=dict(eye=dict(x=1.48, y=1.28, z=0.94)),
+        aspectmode="manual",
+        aspectratio=dict(x=1.12, y=1.0, z=0.9),
+    ),
+)
+fig_surface
+```
+
+## 2. Actual vs Predicted Revenue Explorer
+
+This view compares observed and predicted `log_revenue` on the training data for the fitted models. 
+
+```{python}
+train_prediction_compare_df = train_df.copy()
+train_prediction_compare_df["actual"] = y_train.values
+train_prediction_compare_df["Linear regression"] = linear_model.predict(train_df)
+train_prediction_compare_df["Spline GAM"] = gam_model.predict(train_df)
+train_prediction_compare_df["XGBoost"] = xgb_model.predict(X_train_tree) if xgb_available else np.nan
+train_prediction_compare_df["primary_genre"] = movies.loc[train_df.index, "primary_genre"].values
+train_prediction_compare_df["title"] = movies.loc[train_df.index, "title"].values
+train_prediction_compare_df["release_year"] = movies.loc[train_df.index, "release_year"].values
+
+prediction_long = train_prediction_compare_df.melt(
+    id_vars=["actual", "primary_genre", "title", "release_year"],
+    value_vars=["Linear regression", "Spline GAM", "XGBoost"],
+    var_name="model",
+    value_name="predicted",
+)
+
+model_selection = alt.selection_point(
+    fields=["model"],
+    bind=alt.binding_select(
+        options=["Linear regression", "Spline GAM", "XGBoost"],
+        name="Model: ",
+    ),
+    value="Linear regression",
+)
+
+genre_focus = alt.selection_point(
+    fields=["primary_genre"],
+    bind="legend",
+    on="click",
+    clear="dblclick",
+)
+
+diagonal_df = pd.DataFrame(
+    {
+        "x": [prediction_long["actual"].min(), prediction_long["actual"].max()],
+        "y": [prediction_long["actual"].min(), prediction_long["actual"].max()],
+    }
+)
+
+diag_line = (
+    alt.Chart(diagonal_df)
+    .mark_line(strokeDash=[5, 5], color="#7f8c8d")
+    .encode(x="x:Q", y="y:Q")
+)
+
+pred_scatter = (
+    alt.Chart(prediction_long)
+    .mark_circle(strokeWidth=0)
+    .encode(
+        x=alt.X("actual:Q", title="Observed log10(revenue)", scale=alt.Scale(zero=False)),
+        y=alt.Y("predicted:Q", title="Predicted log10(revenue)", scale=alt.Scale(zero=False)),
+        color=alt.Color(
+            "primary_genre:N",
+            title="Primary genre",
+            scale=alt.Scale(range=genre_palette),
+            legend=alt.Legend(columns=2),
+        ),
+        opacity=alt.condition(genre_focus, alt.value(0.92), alt.value(0.12)),
+        size=alt.condition(genre_focus, alt.value(70), alt.value(42)),
+        tooltip=[
+            alt.Tooltip("title:N", title="Title"),
+            alt.Tooltip("primary_genre:N", title="Genre"),
+            alt.Tooltip("release_year:Q", title="Year"),
+            alt.Tooltip("model:N", title="Model"),
+            alt.Tooltip("actual:Q", title="Observed", format=".2f"),
+            alt.Tooltip("predicted:Q", title="Predicted", format=".2f"),
+        ],
+    )
+    .add_params(model_selection, genre_focus)
+    .transform_filter(model_selection)
+    .properties(
+        title="Training-Set Actual vs Predicted Revenue Explorer",
+        width=760,
+        height=460,
+    )
+)
+
+(diag_line + pred_scatter).configure_view(stroke=None).configure_axis(
+    labelColor="#34495e",
+    titleColor="#22313f",
+    gridColor="#e8eef4",
+).configure_title(
+    color="#22313f",
+    fontSize=18,
+    anchor="start",
+)
+```
+
+## 3. What Drives XGBoost Predictions?
+
+This linked drilldown uses SHAP summaries to show how XGBoost relies on each feature within each genre.
+
+```{python}
+if shap_available and xgb_available:
+    shap_feature_map = {
+        "log_budget": "num__log_budget",
+        "log_vote_count": "num__log_vote_count",
+        "log_popularity": "num__log_popularity",
+        "vote_average": "num__vote_average",
+        "year_centered": "num__year_centered",
+        "in_collection": "num__in_collection",
+    }
+
+    feature_names_list = list(feature_names)
+    shap_feature_frames = []
+
+    for display_feature, encoded_feature in shap_feature_map.items():
+        if encoded_feature in feature_names_list:
+            feature_index = feature_names_list.index(encoded_feature)
+            shap_feature_frames.append(
+                pd.DataFrame(
+                    {
+                        "selected_feature": display_feature,
+                        "feature_value": X_test_tree_dense[:, feature_index],
+                        "shap_value": xgb_shap_values[:, feature_index],
+                        "title": xgb_test_meta["title"].values,
+                        "primary_genre": xgb_test_meta["primary_genre"].values,
+                        "release_year": xgb_test_meta["release_year"].values,
+                    }
+                )
+            )
+
+    shap_long_df = pd.concat(shap_feature_frames, ignore_index=True)
+
+    shap_heatmap_summary = (
+        shap_long_df
+        .groupby(["primary_genre", "selected_feature"], as_index=False)
+        .agg(
+            mean_abs_shap=("shap_value", lambda x: np.mean(np.abs(x))),
+            mean_signed_shap=("shap_value", "mean"),
+            n_movies=("shap_value", "count"),
+        )
+    )
+
+    genre_summary = (
+        shap_heatmap_summary
+        .groupby("primary_genre", as_index=False)
+        .agg(
+            total_mean_abs_shap=("mean_abs_shap", "sum"),
+            total_mean_signed_shap=("mean_signed_shap", "sum"),
+            total_movies=("n_movies", "max"),
+        )
+        .sort_values("total_mean_abs_shap", ascending=False)
+    )
+
+    shap_metric_options = ["mean_abs_shap", "mean_signed_shap"]
+
+    shap_metric_selector = alt.selection_point(
+        fields=["metric"],
+        bind=alt.binding_select(options=shap_metric_options, name="Metric: "),
+        value="mean_abs_shap",
+    )
+
+    genre_drilldown = alt.selection_point(
+        fields=["primary_genre"],
+        on="click",
+        clear="dblclick",
+        value=genre_summary.iloc[0]["primary_genre"],
+    )
+
+    shap_long_metric_df = pd.concat(
+        [
+            shap_heatmap_summary.assign(metric="mean_abs_shap", value=shap_heatmap_summary["mean_abs_shap"]),
+            shap_heatmap_summary.assign(metric="mean_signed_shap", value=shap_heatmap_summary["mean_signed_shap"]),
+        ],
+        ignore_index=True,
+    )
+
+    genre_summary_long = pd.concat(
+        [
+            genre_summary.assign(metric="mean_abs_shap", value=genre_summary["total_mean_abs_shap"]),
+            genre_summary.assign(metric="mean_signed_shap", value=genre_summary["total_mean_signed_shap"]),
+        ],
+        ignore_index=True,
+    )
+
+    genre_panel = (
+        alt.Chart(genre_summary_long)
+        .mark_bar(cornerRadiusEnd=4)
+        .encode(
+            x=alt.X(
+                "value:Q",
+                title="Genre-level SHAP summary",
+            ),
+            y=alt.Y(
+                "primary_genre:N",
+                title=None,
+                sort=alt.SortField(field="total_mean_abs_shap", order="descending"),
+            ),
+            color=alt.Color(
+                "value:Q",
+                title=None,
+                scale=alt.Scale(
+                    scheme="blueorange",
+                    domainMid=0,
+                ),
+                legend=None,
+            ),
+            opacity=alt.condition(genre_drilldown, alt.value(1), alt.value(0.25)),
+            tooltip=[
+                alt.Tooltip("primary_genre:N", title="Genre"),
+                alt.Tooltip("metric:N", title="Metric"),
+                alt.Tooltip("value:Q", title="Value", format=".4f"),
+                alt.Tooltip("total_movies:Q", title="Movies"),
+            ],
+        )
+        .add_params(shap_metric_selector, genre_drilldown)
+        .transform_filter(shap_metric_selector)
+        .properties(
+            title="Click a genre to drill down",
+            width=760,
+            height=220,
+        )
+    )
+
+    feature_panel = (
+        alt.Chart(shap_long_metric_df)
+        .mark_bar(cornerRadiusEnd=4)
+        .encode(
+            x=alt.X("value:Q", title="Feature-level SHAP summary"),
+            y=alt.Y(
+                "selected_feature:N",
+                title=None,
+                sort=list(shap_feature_map.keys()),
+            ),
+            color=alt.Color(
+                "value:Q",
+                title=None,
+                scale=alt.Scale(scheme="blueorange", domainMid=0),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("primary_genre:N", title="Genre"),
+                alt.Tooltip("selected_feature:N", title="Feature"),
+                alt.Tooltip("metric:N", title="Metric"),
+                alt.Tooltip("value:Q", title="Value", format=".4f"),
+                alt.Tooltip("n_movies:Q", title="Movies"),
+            ],
+        )
+        .transform_filter(shap_metric_selector)
+        .transform_filter(genre_drilldown)
+        .properties(
+            title="Selected genre feature profile",
+            width=760,
+            height=280,
+        )
+    )
+
+    shap_drilldown_chart = (
+        genre_panel
+        & feature_panel
+    ).configure_view(
+        stroke=None
+    ).configure_axis(
+        labelColor="#34495e",
+        titleColor="#22313f",
+        gridColor="#e8eef4",
+        domain=False,
+        tickColor="#d8e2ec",
+    ).configure_title(
+        color="#22313f",
+        fontSize=18,
+        anchor="start",
+    )
+
+    display(shap_drilldown_chart)
+
+```
+
+# Conclusions and Limitations
+
+The main notebook takeaway is that the transformed linear model, GAM variants, and XGBoost all perform similarly on the available TMDB feature set. The largest remaining limitations are missing business variables such as marketing, release scale, critic response, and inflation adjustment.
+
+# Project Links
+
+- <a href="final_report.pdf" download>Download the PDF report</a>
+- [View the project repository](https://github.com/koolgreg2009/JSC370-Final)
+- [Return to the project home page](index.html)

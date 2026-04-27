@@ -1,0 +1,76 @@
+h1 {
+  font-size: 32px;
+}
+:root {
+  --viz-panel-bg: linear-gradient(180deg, #fcfdff 0%, #f3f7fb 100%);
+  --viz-panel-border: rgba(23, 43, 77, 0.08);
+  --viz-panel-shadow: 0 18px 40px rgba(16, 35, 56, 0.08);
+  --viz-muted: #5f7388;
+  --viz-ink: #152535;
+}
+h1.title {
+  font-size: 32px;
+}
+h2 {
+  font-size: 28px;
+}
+h3 {
+  font-size: 24px;
+  font-style: bold;
+  font-weight: 200;
+}
+h4 {
+  font-size: 20px;
+}
+h5 {
+  font-size: 16px;
+}
+h6 {
+  font-size: 12px;
+}
+img {
+    display: block;
+    margin: auto;
+}
+
+img-circle {
+    border-radius: 50%;
+}
+
+code { /* Code block */
+    font-size: 15px;
+}
+
+.plotly html-widget {
+  width: 100%;
+}
+
+.plotly .plotly-graph-div,
+.cell-output-display .plotly-graph-div {
+  border: 1px solid var(--viz-panel-border);
+  border-radius: 22px;
+  background: var(--viz-panel-bg);
+  box-shadow: var(--viz-panel-shadow);
+  overflow: hidden;
+}
+
+.plotly .modebar,
+.cell-output-display .modebar {
+  background: rgba(255, 255, 255, 0.78) !important;
+  border: 1px solid rgba(23, 43, 77, 0.08);
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(17, 35, 56, 0.12);
+  padding: 4px 6px !important;
+  top: 14px !important;
+  right: 14px !important;
+}
+
+.plotly .modebar-btn svg,
+.cell-output-display .modebar-btn svg {
+  fill: #5c7085 !important;
+}
+
+.plotly .main-svg,
+.cell-output-display .main-svg {
+  border-radius: 22px;
+}

@@ -1,0 +1,26 @@
+project:
+  type: website
+  output-dir: "."
+
+website:
+  title: "JSC370 Final Project"
+  navbar:
+    left:
+      - text: "Interactive Visualizations"
+        href: final.qmd#interactive-visualizations
+      - text: "About"
+        href: about.qmd
+    right:
+      - icon: github
+        href: https://github.com/koolgreg2009/JSC370-Final
+      - text: "JSC370 Home"
+        href: https://jsc370.github.io/JSC370-2026/
+  page-footer:
+    center: "Kevin Hu | JSC370 Final Project | 2026"
+
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-float: true
+    css: styles.css
